@@ -8,6 +8,7 @@ const demo = {
 };
 let data = loadData();
 let draggedId = null;
+let dimensionDrag = null;
 let dependencySelection = null;
 let dependencyPreviewId = null;
 let showDependencies = false;
@@ -23,6 +24,7 @@ let documentExportFormat = "pdf";
 let fileDragDepth = 0;
 let drawFrame = null;
 const $ = id => document.getElementById(id);
+const dimensionNames = { area: "Kompetenzbereich", level: "Kompetenzstufe", separator: "Trenner" };
 
 function uid(prefix) { return `${prefix}-${crypto.randomUUID()}`; }
 function loadData() { try { const saved = localStorage.getItem(STORAGE_KEY); return saved ? normalize(JSON.parse(saved)) : structuredClone(demo); } catch { return structuredClone(demo); } }
@@ -30,12 +32,18 @@ function normalize(value) {
   const next = value && typeof value === "object" ? value : structuredClone(demo);
   next.levels = Array.isArray(next.levels) && next.levels.length ? next.levels : structuredClone(demo.levels);
   next.areas = Array.isArray(next.areas) && next.areas.length ? next.areas : structuredClone(demo.areas);
+  let firstArea = next.areas.find(row => !row.separator);
+  if (!firstArea) {
+    firstArea = { id: uid("area"), name: demo.areas[0].name };
+    next.areas.push(firstArea);
+  }
   next.competencies = Array.isArray(next.competencies) ? next.competencies : [];
-  next.competencies = next.competencies.map(c => ({ id: c.id || uid("competency"), text: c.text || c.description || "", materials: c.materials || c.material || "", notes: c.notes || "", areaId: c.areaId || next.areas[0].id, levelId: c.levelId || next.levels[0].id, prerequisites: Array.isArray(c.prerequisites) ? c.prerequisites : Array.isArray(c.prerequisiteIds) ? c.prerequisiteIds : [] }));
+  next.competencies = next.competencies.map(c => ({ id: c.id || uid("competency"), text: c.text || c.description || "", materials: c.materials || c.material || "", notes: c.notes || "", areaId: c.areaId || firstArea.id, levelId: c.levelId || next.levels[0].id, prerequisites: Array.isArray(c.prerequisites) ? c.prerequisites : Array.isArray(c.prerequisiteIds) ? c.prerequisiteIds : [] }));
   return next;
 }
 function save() { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); $("saveState").textContent = "Gerade gespeichert"; setTimeout(() => $("saveState").textContent = "Lokal gespeichert", 900); }
 function render() {
+  dimensionDrag = null;
   $("titleInput").value = data.title || "Kompetenzraster";
   $("titleInput").disabled = presentationMode;
   $("headerTitle").textContent = data.title || "Kompetenzraster";
@@ -55,13 +63,86 @@ function render() {
   $("addAreaButton").hidden = presentationMode; $("addLevelButton").hidden = presentationMode;
   const board = $("board"); board.style.setProperty("--level-count", data.levels.length); board.replaceChildren();
   const corner = document.createElement("div"); corner.className = "board-header"; corner.textContent = "Kompetenzbereich"; board.append(corner);
-  data.levels.forEach(level => { const head = document.createElement("div"); head.className = "board-header level level-label"; head.dataset.levelId = level.id; const span = document.createElement("span"); span.textContent = level.name; if (!presentationMode) { const edit = button("✎", "secondary", () => editText("level", level.id)); edit.title = "Kompetenzstufe bearbeiten"; head.append(span, edit); } else head.append(span); board.append(head); });
-  data.areas.forEach((area, index) => {
-    const label = document.createElement("div"); label.className = "area-label"; label.innerHTML = `<span></span>`; label.firstChild.textContent = area.name; if (!presentationMode) { const editArea = button("✎", "secondary", () => editText("area", area.id)); editArea.title = "Kompetenzbereich bearbeiten"; label.append(editArea); } board.append(label);
-    data.levels.forEach(level => board.append(makeDropZone(area, level, index)));
+  data.levels.forEach(level => board.append(makeDimensionLabel("level", level)));
+  let areaIndex = 0;
+  data.areas.forEach(area => {
+    board.append(makeDimensionLabel("area", area));
+    if (area.separator) return;
+    data.levels.forEach(level => board.append(makeDropZone(area, level, areaIndex)));
+    areaIndex += 1;
   });
   drawDependencies();
 }
+function makeDimensionLabel(kind, item) {
+  const isArea = kind === "area";
+  const collection = dimensionCollection(kind);
+  const editKind = item.separator ? "separator" : kind;
+  const name = dimensionNames[editKind];
+  const label = document.createElement("div");
+  label.className = isArea ? "area-label" : "board-header level level-label";
+  if (item.separator) label.classList.add("separator-row");
+  label.dataset[kind + "Id"] = item.id;
+  const title = document.createElement("span");
+  title.textContent = item.name;
+  label.append(title);
+  if (presentationMode) return label;
+
+  const edit = button("✎", "secondary", () => editText(editKind, item));
+  edit.title = `${name} bearbeiten`;
+  edit.setAttribute("aria-label", edit.title);
+  label.append(edit);
+  if (collection.length > 1) addDimensionDrag(label, kind, item, collection, name);
+  return label;
+}
+
+function addDimensionDrag(label, kind, item, collection, name) {
+  const handle = document.createElement("span");
+  handle.className = "dimension-drag-handle";
+  handle.textContent = "⠿";
+  handle.title = `${name} durch Ziehen verschieben`;
+  handle.setAttribute("aria-hidden", "true");
+  handle.draggable = true;
+  label.prepend(handle);
+
+  handle.addEventListener("dragstart", e => {
+    dimensionDrag = { kind, item };
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("application/x-kompetenzraster-dimension", item.id);
+  });
+  handle.addEventListener("dragend", () => {
+    dimensionDrag = null;
+    $("board").querySelectorAll("[data-drop-edge]").forEach(el => delete el.dataset.dropEdge);
+  });
+
+  function isAfterMidpoint(e) {
+    const rect = label.getBoundingClientRect();
+    return kind === "area" ? e.clientY >= rect.top + rect.height / 2 : e.clientX >= rect.left + rect.width / 2;
+  }
+  function acceptsDrag() {
+    return !presentationMode && dimensionDrag?.kind === kind && dimensionDrag.item !== item;
+  }
+  label.addEventListener("dragover", e => {
+    if (!acceptsDrag()) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    label.dataset.dropEdge = isAfterMidpoint(e) ? "after" : "before";
+  });
+  label.addEventListener("dragleave", e => {
+    if (!label.contains(e.relatedTarget)) delete label.dataset.dropEdge;
+  });
+  label.addEventListener("drop", e => {
+    if (!acceptsDrag()) return;
+    e.preventDefault();
+    const from = collection.indexOf(dimensionDrag.item);
+    const target = collection.indexOf(item);
+    const insertAt = target + Number(isAfterMidpoint(e)) - Number(from < target);
+    if (from === insertAt) return;
+    collection.splice(insertAt, 0, collection.splice(from, 1)[0]);
+    save();
+    render();
+  });
+}
+
 function button(text, className, handler) { const b = document.createElement("button"); b.type = "button"; b.textContent = text; b.className = className || ""; b.addEventListener("click", handler); return b; }
 function setViewIcon(id, kind) { $(id).innerHTML = `<svg aria-hidden="true"><use href="#icon-${kind}"/></svg>`; }
 function infoIcon(kind) { return kind === "materials" ? '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5.5C10.4 4.1 8.2 3.5 5 3.5H3v15h2c3.2 0 5.4.6 7 2 1.6-1.4 3.8-2 7-2h2v-15h-2c-3.2 0-5.4.6-7 2Z"/><path d="M12 5.5v15"/></svg>' : '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.5"/><path d="M12 10.5v6M12 7.5h.01"/></svg>'; }
@@ -90,7 +171,7 @@ function makeCard(c) {
   card.addEventListener("click", () => { if (dependencySelection && dependencySelection.id !== c.id) { const sourceId = dependencySelection.role === "prerequisite" ? dependencySelection.id : c.id; const targetId = dependencySelection.role === "prerequisite" ? c.id : dependencySelection.id; addDependency(sourceId, targetId); } }); card.addEventListener("mouseenter", () => { if (dependencySelection && dependencySelection.id !== c.id) { dependencyPreviewId = c.id; drawDependencies(); } }); card.addEventListener("mouseleave", () => { if (dependencyPreviewId === c.id) { dependencyPreviewId = null; drawDependencies(); } }); card.addEventListener("dragstart", e => { draggedId = c.id; card.classList.add("dragging"); e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/plain", c.id); }); card.addEventListener("dragend", () => { draggedId = null; card.classList.remove("dragging"); document.querySelectorAll(".drag-over").forEach(z => z.classList.remove("drag-over")); }); card.addEventListener("dblclick", () => openCompetency(c.id)); return card;
 }
 function onDropEvent(e) {
-  if (presentationMode || [...(e.dataTransfer?.types || [])].includes("Files")) return;
+  if (presentationMode || dimensionDrag || isFileDrag(e)) return;
   e.preventDefault();
   const zone = e.currentTarget;
   if (e.type === "dragover") { zone.classList.add("drag-over"); return; }
@@ -145,21 +226,71 @@ function drawDependencyArrow(layer, sourceEl, targetEl, preview = false) {
   const board = $("board"); const boardRect = board.getBoundingClientRect(); const a = sourceEl.getBoundingClientRect(); const b = targetEl.getBoundingClientRect(); const x1 = a.left - boardRect.left + board.scrollLeft + a.width / 2; const y1 = a.top - boardRect.top + board.scrollTop + a.height / 2; const x2 = b.left - boardRect.left + board.scrollLeft + b.width / 2; const y2 = b.top - boardRect.top + board.scrollTop + b.height / 2; const path = document.createElementNS("http://www.w3.org/2000/svg", "path"); path.setAttribute("d", "M " + x1 + " " + y1 + " L " + x2 + " " + y2); path.setAttribute("class", preview ? "dependency-preview" : ""); path.setAttribute("fill", "none"); path.setAttribute("stroke", "#754c92"); path.setAttribute("stroke-opacity", preview ? ".65" : ".5"); path.setAttribute("stroke-width", preview ? "4" : "3"); path.setAttribute("stroke-linecap", "round"); path.setAttribute("marker-end", "url(#dependency-arrow)"); layer.append(path);
 }
 function scheduleDraw() { cancelAnimationFrame(drawFrame); drawFrame = requestAnimationFrame(drawDependencies); }
-function openCompetency(id, areaId, levelId) { if (presentationMode) return; const c = data.competencies.find(x => x.id === id); $("competencyId").value = id || ""; $("competencyDialogTitle").textContent = c ? "Kompetenz bearbeiten" : "Kompetenz hinzufügen"; $("competencyText").value = c?.text || ""; $("competencyMaterials").value = c?.materials || ""; $("competencyNotes").value = c?.notes || ""; $("deleteCompetencyButton").hidden = !c; $("competencyForm").dataset.areaId = areaId || c?.areaId || data.areas[0].id; $("competencyForm").dataset.levelId = levelId || c?.levelId || data.levels[0].id; renderPrerequisites(c); $("competencyDialog").showModal(); $("competencyText").focus(); }
+function openCompetency(id, areaId, levelId) { if (presentationMode) return; const c = data.competencies.find(x => x.id === id); $("competencyId").value = id || ""; $("competencyDialogTitle").textContent = c ? "Kompetenz bearbeiten" : "Kompetenz hinzufügen"; $("competencyText").value = c?.text || ""; $("competencyMaterials").value = c?.materials || ""; $("competencyNotes").value = c?.notes || ""; $("deleteCompetencyButton").hidden = !c; $("competencyForm").dataset.areaId = areaId || c?.areaId || data.areas.find(row => !row.separator).id; $("competencyForm").dataset.levelId = levelId || c?.levelId || data.levels[0].id; renderPrerequisites(c); $("competencyDialog").showModal(); $("competencyText").focus(); }
 function detailToggle(c, kind, visible) { const toggle = button("", `info-button ${kind === "materials" ? "material-button" : "note-button"} ${visible ? "active" : ""}`, e => { e.stopPropagation(); const shown = kind === "materials" ? shownMaterials : shownNotes; const hidden = kind === "materials" ? hiddenMaterials : hiddenNotes; if (visible) { if (kind === "materials" ? showMaterials : showNotes) hidden.add(c.id); else shown.delete(c.id); } else { if (kind === "materials" ? showMaterials : showNotes) hidden.delete(c.id); else shown.add(c.id); } render(); }); toggle.addEventListener("dblclick", e => e.stopPropagation()); toggle.innerHTML = infoIcon(kind); toggle.title = `${kind === "materials" ? "Material" : "Bemerkung"} ${visible ? "ausblenden" : "anzeigen"}`; toggle.setAttribute("aria-label", toggle.title); toggle.setAttribute("aria-pressed", String(visible)); return toggle; }
 function detailBlock(c, kind) { const block = document.createElement("div"); block.className = `card-extra ${kind === "materials" ? "material-extra" : "notes-extra"}`; block.append(detailToggle(c, kind, true)); const content = document.createElement("span"); addLinkedText(content, c[kind]); block.append(content); return block; }
 document.querySelectorAll("[data-dialog-cancel]").forEach(button => button.addEventListener("click", () => button.closest("dialog").close()));
 function renderPrerequisites(current) { const list = $("prerequisiteList"); list.replaceChildren(); const selected = new Set(current?.prerequisites || []); data.competencies.filter(c => c.id !== current?.id).forEach(c => { const label = document.createElement("label"); label.className = "prerequisite-option"; const input = document.createElement("input"); input.type = "checkbox"; input.value = c.id; input.checked = selected.has(c.id); const span = document.createElement("span"); span.textContent = c.text || "Unbenannte Kompetenz"; label.append(input, span); list.append(label); }); if (!list.children.length) list.textContent = "Lege zunächst weitere Kompetenzen an."; }
 $("competencyForm").addEventListener("submit", e => { const form = e.currentTarget; if (e.submitter?.value === "cancel") { e.preventDefault(); $("competencyDialog").close(); return; } e.preventDefault(); const id = $("competencyId").value || uid("competency"); const existing = data.competencies.find(c => c.id === id); const c = existing || { id }; Object.assign(c, { text: $("competencyText").value.trim(), materials: $("competencyMaterials").value.trim(), notes: $("competencyNotes").value.trim(), areaId: form.dataset.areaId, levelId: form.dataset.levelId, prerequisites: [...document.querySelectorAll("#prerequisiteList input:checked")].map(x => x.value) }); if (!existing) data.competencies.push(c); save(); $("competencyDialog").close(); render(); });
 $("deleteCompetencyButton").addEventListener("click", () => { const id = $("competencyId").value; if (!id || !confirm("Kompetenz wirklich löschen?")) return; data.competencies = data.competencies.filter(c => c.id !== id).map(c => ({ ...c, prerequisites: c.prerequisites.filter(p => p !== id) })); save(); $("competencyDialog").close(); render(); });
-function editText(kind, id) { if (presentationMode) return; const collection = kind === "area" ? data.areas : data.levels; const item = collection.find(x => x.id === id); $("textDialogTitle").textContent = kind === "area" ? "Kompetenzbereich bearbeiten" : "Kompetenzstufe bearbeiten"; $("textInput").value = item.name; $("textForm").dataset.kind = kind; $("textForm").dataset.id = id; $("deleteTextButton").hidden = collection.length <= 1; $("textDialog").showModal(); $("textInput").focus(); }
-$("textForm").addEventListener("submit", e => { const f = e.currentTarget; if (e.submitter?.value === "cancel") { e.preventDefault(); $("textDialog").close(); return; } e.preventDefault(); const collection = f.dataset.kind === "area" ? data.areas : data.levels; const item = collection.find(x => x.id === f.dataset.id); if (item) item.name = $("textInput").value.trim() || item.name; save(); $("textDialog").close(); render(); });
-function deleteDimension(kind, id) { const collection = kind === "area" ? data.areas : data.levels; if (collection.length <= 1) return; const item = collection.find(x => x.id === id); if (!item || !confirm(`${kind === "area" ? "Kompetenzbereich" : "Kompetenzstufe"} „${item.name}“ wirklich löschen? Die zugehörigen Kompetenzen werden ebenfalls gelöscht.`)) return; const removedIds = new Set(data.competencies.filter(c => c[kind + "Id"] === id).map(c => c.id)); data.competencies = data.competencies.filter(c => !removedIds.has(c.id)).map(c => ({ ...c, prerequisites: c.prerequisites.filter(p => !removedIds.has(p)) })); if (kind === "area") data.areas = data.areas.filter(x => x.id !== id); else data.levels = data.levels.filter(x => x.id !== id); save(); if ($("textDialog").open) $("textDialog").close(); render(); }
+function dimensionCollection(kind) {
+  return kind === "level" ? data.levels : data.areas;
+}
+function canDeleteDimension(kind) {
+  if (kind === "separator") return true;
+  return dimensionCollection(kind).filter(row => !row.separator).length > 1;
+}
+function editText(kind, item) {
+  if (presentationMode) return;
+  $("textDialogTitle").textContent = `${dimensionNames[kind]} ${item ? "bearbeiten" : "hinzufügen"}`;
+  $("textInput").value = item?.name ?? "";
+  $("textForm").dataset.kind = kind;
+  $("textForm").dataset.id = item?.id ?? "";
+  $("deleteTextButton").hidden = !item || !canDeleteDimension(kind);
+  $("textDialog").showModal();
+  $("textInput").focus();
+}
+$("textForm").addEventListener("submit", e => {
+  e.preventDefault();
+  const { kind, id } = e.currentTarget.dataset;
+  const name = $("textInput").value.trim();
+  if (e.submitter?.value === "cancel") {
+    $("textDialog").close();
+    return;
+  }
+  if (presentationMode) return;
+  const collection = dimensionCollection(kind);
+  const item = collection.find(row => String(row.id) === id);
+  if (!item && !name) return;
+  if (item) item.name = name || item.name;
+  else if (kind === "separator" && !id) collection.push({ id: uid("separator"), name, separator: true });
+  save();
+  $("textDialog").close();
+  render();
+});
+function deleteDimension(kind, id) {
+  if (presentationMode || !canDeleteDimension(kind)) return;
+  const collection = dimensionCollection(kind);
+  const index = collection.findIndex(row => String(row.id) === id);
+  if (index < 0) return;
+  const item = collection[index];
+  const warning = kind === "separator" ? "" : " Die zugehörigen Kompetenzen werden ebenfalls gelöscht.";
+  if (!confirm(`${dimensionNames[kind]} „${item.name}“ wirklich löschen?${warning}`)) return;
+  if (kind !== "separator") {
+    const removedIds = new Set(data.competencies.filter(c => c[kind + "Id"] === item.id).map(c => c.id));
+    data.competencies = data.competencies.filter(c => !removedIds.has(c.id)).map(c => ({ ...c, prerequisites: c.prerequisites.filter(p => !removedIds.has(p)) }));
+  }
+  collection.splice(index, 1);
+  save();
+  $("textDialog").close();
+  render();
+}
 $("deleteTextButton").addEventListener("click", () => deleteDimension($("textForm").dataset.kind, $("textForm").dataset.id));
+$("addSeparatorButton").addEventListener("click", () => editText("separator"));
 $("addAreaButton").addEventListener("click", () => { const name = prompt("Name des Kompetenzbereichs:", "Neuer Kompetenzbereich"); if (!name?.trim()) return; data.areas.push({ id: uid("area"), name: name.trim() }); save(); render(); });
 $("addLevelButton").addEventListener("click", () => { const name = prompt("Name der Kompetenzstufe:", `Level ${data.levels.length + 1}`); if (!name?.trim()) return; data.levels.push({ id: uid("level"), name: name.trim() }); save(); render(); });
 $("titleInput").addEventListener("change", e => { data.title = e.target.value.trim() || "Kompetenzraster"; save(); });
-function makeMarkdown() { const esc = s => String(s || "").replace(/([\\|])/g, "\\$1").replace(/\n/g, "<br>"); const headers = data.levels.map(l => ` ${esc(l.name)} `).join("|"); const separator = data.levels.map(() => "---").join("|"); const rows = data.areas.map(a => { const cells = data.levels.map(l => data.competencies.filter(c => c.areaId === a.id && c.levelId === l.id).map(c => `${esc(c.text)}${c.materials ? `<br><small>Material: ${esc(c.materials)}</small>` : ""}`).join("<br><br>")); return `| ${esc(a.name)} | ${cells.join(" | ")} |`; }).join("\n"); return `# ${data.title || "Kompetenzraster"}\n\n| Kompetenzbereich |${headers}|\n|---|${separator}|\n${rows}\n`; }
+function makeMarkdown() { const esc = s => String(s || "").replace(/([\\|])/g, "\\$1").replace(/\n/g, "<br>"); const headers = data.levels.map(l => ` ${esc(l.name)} `).join("|"); const separator = data.levels.map(() => "---").join("|"); const rows = data.areas.map(a => { if (a.separator) return `| **${esc(a.name)}** |${data.levels.map(() => " |").join("")}`; const cells = data.levels.map(l => data.competencies.filter(c => c.areaId === a.id && c.levelId === l.id).map(c => `${esc(c.text)}${c.materials ? `<br><small>Material: ${esc(c.materials)}</small>` : ""}`).join("<br><br>")); return `| ${esc(a.name)} | ${cells.join(" | ")} |`; }).join("\n"); return `# ${data.title || "Kompetenzraster"}\n\n| Kompetenzbereich |${headers}|\n|---|${separator}|\n${rows}\n`; }
 function bytesToBase64(bytes) { let binary = ""; for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000)); return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); }
 function base64ToBytes(value) { const binary = atob(value.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - value.length % 4) % 4)); return Uint8Array.from(binary, char => char.charCodeAt(0)); }
 async function encodeRaster() { const json = JSON.stringify(data); if ("CompressionStream" in window) { const stream = new Blob([json]).stream().pipeThrough(new CompressionStream("deflate-raw")); return `d1.${bytesToBase64(new Uint8Array(await new Response(stream).arrayBuffer()))}`; } return `p1.${bytesToBase64(new TextEncoder().encode(json))}`; }
@@ -184,7 +315,7 @@ function downloadBlob(name, blob) { const a = document.createElement("a"); a.hre
 function openDocumentDialog(format) { documentExportFormat = format; $("exportDialog").close(); $("documentExportTitle").textContent = format === "docx" ? "Word-Export" : "PDF-Export"; $("createDocumentButton").textContent = format === "docx" ? "Word herunterladen" : "PDF herunterladen"; $("pdfTitle").value = data.title || "Kompetenzraster"; $("pdfSubtitle").value = ""; $("pdfAuthor").value = ""; $("pdfDate").value = new Date().toISOString().slice(0, 10); $("pdfIncludeMaterials").checked = showMaterials; $("pdfIncludeNotes").checked = showNotes; $("pdfIncludeDependencies").checked = showDependencies; $("pdfDialog").showModal(); }
 function pdfSettings() { return { title: $("pdfTitle").value.trim() || "Kompetenzraster", subtitle: $("pdfSubtitle").value.trim(), author: $("pdfAuthor").value.trim(), date: $("pdfDate").value, pageSize: $("pdfPageSize").value, orientation: $("pdfOrientation").value, includeMaterials: $("pdfIncludeMaterials").checked, includeNotes: $("pdfIncludeNotes").checked, includeDependencies: $("pdfIncludeDependencies").checked, useColors: $("pdfUseColors").checked, includePageNumbers: $("pdfIncludePageNumbers").checked }; }
 function pdfCard(c, settings) { const lines = [{ text: c.text || "Unbenannte Kompetenz", style: "cardText" }]; if (settings.includeMaterials && c.materials) lines.push({ text: `Material: ${c.materials}`, style: "cardDetail" }); if (settings.includeNotes && c.notes) lines.push({ text: `Bemerkungen: ${c.notes}`, style: "cardDetail" }); if (settings.includeDependencies && c.prerequisites?.length) { const names = c.prerequisites.map(id => data.competencies.find(item => item.id === id)?.text || "Unbenannte Kompetenz"); lines.push({ text: `Voraussetzungen: ${names.join("; ")}`, style: "cardDetail" }); } return { stack: lines, margin: [5, 5, 5, 5], fillColor: settings.useColors ? "#f4f8fa" : "#ffffff" }; }
-function makePdfDefinition(settings) { const colors = settings.useColors ? { header: "#c6d5dd", area: "#dfe8ed", line: "#c7d4da" } : { header: "#eeeeee", area: "#f5f5f5", line: "#888888" }; const body = [[{ text: "Kompetenzbereich", style: "tableHeader" }, ...data.levels.map(level => ({ text: level.name, style: "tableHeader" }))]]; data.areas.forEach(area => { body.push([{ text: area.name, style: "areaLabel" }, ...data.levels.map(level => { const cards = data.competencies.filter(c => c.areaId === area.id && c.levelId === level.id); return cards.length ? { stack: cards.map(c => pdfCard(c, settings)) } : ""; })]); }); const titleStack = [{ text: settings.title, style: "title" }]; if (settings.subtitle) titleStack.push({ text: settings.subtitle, style: "subtitle" }); if (settings.date) titleStack.push({ text: settings.date, style: "date" }); return { pageSize: settings.pageSize, pageOrientation: settings.orientation, pageMargins: [24, 28, 24, 28], info: { title: settings.title, author: settings.author || undefined, subject: settings.subtitle || undefined, keywords: "Kompetenzraster" }, header: (currentPage) => currentPage === 1 ? null : { text: settings.title, style: "runningHeader", margin: [24, 12, 24, 0] }, footer: settings.includePageNumbers ? (currentPage, pageCount) => ({ text: `Seite ${currentPage} von ${pageCount}`, alignment: "center", style: "footer" }) : undefined, content: [{ stack: titleStack, margin: [0, 0, 0, 16] }, { table: { headerRows: 1, widths: [125, ...data.levels.map(() => "*")], body }, layout: { hLineColor: () => colors.line, vLineColor: () => colors.line, hLineWidth: () => 0.7, vLineWidth: () => 0.7, paddingLeft: () => 6, paddingRight: () => 6, paddingTop: () => 6, paddingBottom: () => 6 } }], styles: { title: { fontSize: 20, bold: true, color: "#183344" }, subtitle: { fontSize: 12, color: "#647784", margin: [0, 3, 0, 0] }, date: { fontSize: 9, color: "#647784", margin: [0, 6, 0, 0] }, tableHeader: { bold: true, fillColor: colors.header, color: "#183344", alignment: "center" }, areaLabel: { bold: true, fillColor: colors.area, color: "#183344" }, cardText: { fontSize: 9, color: "#183344" }, cardDetail: { fontSize: 7.5, color: "#647784", margin: [0, 3, 0, 0] }, runningHeader: { fontSize: 8, color: "#647784" }, footer: { fontSize: 8, color: "#647784" } }, defaultStyle: { font: "Roboto", fontSize: 9, lineHeight: 1.15 } }; }
+function makePdfDefinition(settings) { const colors = settings.useColors ? { header: "#c6d5dd", area: "#dfe8ed", line: "#c7d4da" } : { header: "#eeeeee", area: "#f5f5f5", line: "#888888" }; const body = [[{ text: "Kompetenzbereich", style: "tableHeader" }, ...data.levels.map(level => ({ text: level.name, style: "tableHeader" }))]]; data.areas.forEach(area => { if (area.separator) { body.push([{ text: area.name, style: "areaLabel", colSpan: data.levels.length + 1, fillColor: colors.header }, ...data.levels.map(() => ({}))]); return; } body.push([{ text: area.name, style: "areaLabel" }, ...data.levels.map(level => { const cards = data.competencies.filter(c => c.areaId === area.id && c.levelId === level.id); return cards.length ? { stack: cards.map(c => pdfCard(c, settings)) } : ""; })]); }); const titleStack = [{ text: settings.title, style: "title" }]; if (settings.subtitle) titleStack.push({ text: settings.subtitle, style: "subtitle" }); if (settings.date) titleStack.push({ text: settings.date, style: "date" }); return { pageSize: settings.pageSize, pageOrientation: settings.orientation, pageMargins: [24, 28, 24, 28], info: { title: settings.title, author: settings.author || undefined, subject: settings.subtitle || undefined, keywords: "Kompetenzraster" }, header: (currentPage) => currentPage === 1 ? null : { text: settings.title, style: "runningHeader", margin: [24, 12, 24, 0] }, footer: settings.includePageNumbers ? (currentPage, pageCount) => ({ text: `Seite ${currentPage} von ${pageCount}`, alignment: "center", style: "footer" }) : undefined, content: [{ stack: titleStack, margin: [0, 0, 0, 16] }, { table: { headerRows: 1, widths: [125, ...data.levels.map(() => "*")], body }, layout: { hLineColor: () => colors.line, vLineColor: () => colors.line, hLineWidth: () => 0.7, vLineWidth: () => 0.7, paddingLeft: () => 6, paddingRight: () => 6, paddingTop: () => 6, paddingBottom: () => 6 } }], styles: { title: { fontSize: 20, bold: true, color: "#183344" }, subtitle: { fontSize: 12, color: "#647784", margin: [0, 3, 0, 0] }, date: { fontSize: 9, color: "#647784", margin: [0, 6, 0, 0] }, tableHeader: { bold: true, fillColor: colors.header, color: "#183344", alignment: "center" }, areaLabel: { bold: true, fillColor: colors.area, color: "#183344" }, cardText: { fontSize: 9, color: "#183344" }, cardDetail: { fontSize: 7.5, color: "#647784", margin: [0, 3, 0, 0] }, runningHeader: { fontSize: 8, color: "#647784" }, footer: { fontSize: 8, color: "#647784" } }, defaultStyle: { font: "Roboto", fontSize: 9, lineHeight: 1.15 } }; }
 function exportPdf() { const settings = pdfSettings(); if (!window.pdfMake) { printPdfFallback(settings); return; } $("pdfDialog").close(); const safeName = settings.title.replace(/[^a-z0-9äöüß _-]/gi, "").trim().replace(/\s+/g, "-") || "kompetenzraster"; window.pdfMake.createPdf(makePdfDefinition(settings)).download(`${safeName}.pdf`); }
 function printPdfFallback(settings) { const previous = { showMaterials, showNotes, showDependencies, presentationMode }; showMaterials = settings.includeMaterials; showNotes = settings.includeNotes; showDependencies = settings.includeDependencies; presentationMode = false; render(); $("pdfDialog").close(); const originalTitle = document.title; document.title = settings.title; window.addEventListener("afterprint", () => { showMaterials = previous.showMaterials; showNotes = previous.showNotes; showDependencies = previous.showDependencies; presentationMode = previous.presentationMode; document.title = originalTitle; render(); }, { once: true }); window.print(); }
 function docxText(text, options = {}) { return new docx.TextRun({ text: String(text || ""), ...options }); }
@@ -217,6 +348,16 @@ async function exportDocx() {
   ];
   const rows = [new TableRow({ tableHeader: true, children: headerCells })];
   data.areas.forEach(area => {
+    if (area.separator) {
+      const cell = new TableCell({
+        columnSpan: data.levels.length + 1,
+        shading: { type: ShadingType.CLEAR, fill: colors.header },
+        margins: cellMargins,
+        children: [new Paragraph({ keepNext: true, children: [new TextRun({ text: area.name, bold: true, size: 18 })] })]
+      });
+      rows.push(new TableRow({ cantSplit: true, children: [cell] }));
+      return;
+    }
     const cells = [new TableCell({ width: { size: areaWidth, type: WidthType.DXA }, shading: { type: ShadingType.CLEAR, fill: colors.area }, margins: cellMargins, children: [new Paragraph({ children: [new TextRun({ text: area.name, bold: true, size: 18 })] })] })];
     data.levels.forEach(level => {
       const cards = data.competencies.filter(c => c.areaId === area.id && c.levelId === level.id);
@@ -233,7 +374,7 @@ async function exportDocx() {
   downloadBlob(safeName + ".docx", blob);
 }
 $("createDocumentButton").addEventListener("click", e => { e.preventDefault(); if (documentExportFormat === "docx") exportDocx(); else exportPdf(); });
-function makeHtml() { const esc = s => String(s || "").replace(/[&<>\"]/g, x => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[x])); const rich = s => esc(s).replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1">$1</a>').replace(/\n/g, "<br>"); const headers = data.levels.map(l => `<th>${esc(l.name)}</th>`).join(""); const rows = data.areas.map(a => `<tr><th>${esc(a.name)}</th>${data.levels.map(l => `<td>${data.competencies.filter(c => c.areaId === a.id && c.levelId === l.id).map(c => `<p>${rich(c.text)}</p>${c.materials ? `<small>Material: ${rich(c.materials)}</small>` : ""}${c.notes ? `<small>Bemerkungen: ${rich(c.notes)}</small>` : ""}`).join("")}</td>`).join("")}</tr>`).join(""); return `<!doctype html><meta charset="utf-8"><title>${esc(data.title)}</title><style>body{font:15px system-ui;color:#183344}table{border-collapse:collapse;width:100%}th,td{border:1px solid #c7d4da;padding:10px;vertical-align:top}thead th{background:#c6d5dd}tbody tr:nth-child(odd){background:#f0f4f6}th:first-child{text-align:left}p{margin:0 0 9px}small{display:block;color:#647784;margin-top:5px}</style><h1>${esc(data.title)}</h1><table><thead><tr><th>Kompetenzbereich</th>${headers}</tr></thead><tbody>${rows}</tbody></table>`; }
+function makeHtml() { const esc = s => String(s || "").replace(/[&<>\"]/g, x => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[x])); const rich = s => esc(s).replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1">$1</a>').replace(/\n/g, "<br>"); const headers = data.levels.map(l => `<th>${esc(l.name)}</th>`).join(""); const rows = data.areas.map(a => a.separator ? `<tr class="separator"><th colspan="${data.levels.length + 1}">${esc(a.name)}</th></tr>` : `<tr><th>${esc(a.name)}</th>${data.levels.map(l => `<td>${data.competencies.filter(c => c.areaId === a.id && c.levelId === l.id).map(c => `<p>${rich(c.text)}</p>${c.materials ? `<small>Material: ${rich(c.materials)}</small>` : ""}${c.notes ? `<small>Bemerkungen: ${rich(c.notes)}</small>` : ""}`).join("")}</td>`).join("")}</tr>`).join(""); return `<!doctype html><meta charset="utf-8"><title>${esc(data.title)}</title><style>body{font:15px system-ui;color:#183344}table{border-collapse:collapse;width:100%}th,td{border:1px solid #c7d4da;padding:10px;vertical-align:top}thead th{background:#c6d5dd}tbody tr:nth-child(odd){background:#f0f4f6}.separator th{background:#dfe8ed}th:first-child{text-align:left}p{margin:0 0 9px}small{display:block;color:#647784;margin-top:5px}</style><h1>${esc(data.title)}</h1><table><thead><tr><th>Kompetenzbereich</th>${headers}</tr></thead><tbody>${rows}</tbody></table>`; }
 function setViewToggle(id, value, label) { $(id).classList.toggle("active", value); $(id).setAttribute("aria-pressed", value); $(id).title = `${label} ${value ? "ausblenden" : "anzeigen"}`; $(id).setAttribute("aria-label", $(id).title); }
 $("dependencyToggleButton").addEventListener("click", () => { showDependencies = !showDependencies; setViewToggle("dependencyToggleButton", showDependencies, "Abhängigkeiten"); drawDependencies(); });
 $("materialsToggleButton").addEventListener("click", () => { showMaterials = !showMaterials; shownMaterials.clear(); hiddenMaterials.clear(); render(); });
